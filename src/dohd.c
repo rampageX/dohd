@@ -1491,7 +1491,11 @@ static void usage(const char *name)
     fprintf(stderr, "\tUse '-V' to show version\n");
     fprintf(stderr, "\tUse '-v' for verbose mode\n");
     fprintf(stderr, "\tUse '-F' for foreground mode\n");
+#if DOHD_ENABLE_ODOH
     fprintf(stderr, "\tUse '-O' for Oblivious DoH target mode\n");
+#else
+    fprintf(stderr, "\tOblivious DoH not built (wolfSSL HPKE unavailable; use ODOH=1 to enable)\n");
+#endif
     exit(0);
 }
 
@@ -1590,6 +1594,10 @@ int main(int argc, char *argv[])
                 }
                 break;
             case 'O':
+#if !DOHD_ENABLE_ODOH
+                fprintf(stderr, "ODoH is unavailable in this build; rebuild with ODOH=1 and HPKE-enabled wolfSSL.\n");
+                return 2;
+#endif
                 oblivion_mode = 1;
                 break;
             case 'C':

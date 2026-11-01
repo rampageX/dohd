@@ -27,3 +27,16 @@ jobs:
         run: make -C test check VERSION=0.8
       - name: HTTP2 DNS resolution and callback regression
         run: sudo python3 test/rt_ac5300_h2_smoke.py
+      - name: Rebuild DoH without ODoH HPKE
+        run: |
+          make -C src clean
+          make -C src ODOH=0 LDFLAGS="-O3"
+          ./src/dohd -V 2>&1 | grep '0.8'
+          if ./src/dohd -O 2>&1 | grep -q 'ODoH is unavailable'; then
+            echo 'ODoH-disabled build rejects -O as expected'
+          else
+            echo 'Expected ODoH-disabled error was missing'
+            exit 1
+          fi
+      - name: HTTP2 regression without ODoH
+        run: sudo python3 test/rt_ac5300_h2_smoke.py

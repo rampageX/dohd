@@ -3,9 +3,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#ifndef DOHD_ENABLE_ODOH
+#define DOHD_ENABLE_ODOH 1
+#endif
+#if DOHD_ENABLE_ODOH
 #include <wolfssl/options.h>
 #include <wolfssl/wolfcrypt/hpke.h>
 #include <wolfssl/wolfcrypt/curve25519.h>
+#endif
 
 #define ODOH_MSG_QUERY 0x01
 #define ODOH_MSG_RESPONSE 0x02
@@ -34,20 +39,29 @@ typedef struct {
 } odoh_message_view;
 
 typedef struct {
+#if DOHD_ENABLE_ODOH
     Hpke hpke;
     HpkeBaseContext hpke_ctx;
     odoh_config cfg;
     uint8_t q_plain[ODOH_MAX_MESSAGE];
     uint16_t q_plain_len;
     int valid;
+#else
+    /* Do not reserve ~64 KiB per request when ODoH is disabled. */
+    unsigned char unavailable;
+#endif
 } odoh_client_ctx;
 
 typedef odoh_client_ctx odoh_req_ctx;
 
 typedef struct {
+#if DOHD_ENABLE_ODOH
     odoh_config cfg;
     curve25519_key priv;
     int loaded;
+#else
+    unsigned char unavailable;
+#endif
 } odoh_target_ctx;
 
 int odoh_config_load_file(const char *path, odoh_config *cfg);

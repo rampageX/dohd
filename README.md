@@ -45,6 +45,16 @@ option: `--enable-tls13` or simply `--enable-all`).
 3. Executable will be found in `./src/dohd`.
    `ns2dohd` executable will be found in `./ns2dohd/ns2dohd`.
 
+   On embedded systems, `src/Makefile` auto-detects whether the installed
+   wolfSSL headers provide the HPKE API required by optional ODoH. If not,
+   `make -C src` builds a standard DoH-only daemon; `-O` will explicitly
+   report that ODoH is unavailable. To force the smaller build, use
+   `make -C src ODOH=0 LDFLAGS="-static -s -O3"`. ODoH remains available
+   with `ODOH=1` and a compatible HPKE-enabled wolfSSL. Run
+   `make -C src clean` before switching between these modes. This setting
+   only controls the DoH server in `src/`; the optional `ns2dohd` ODoH
+   client still requires HPKE.
+
 4. Optional install step for binaries and manpages:
 
 ```
