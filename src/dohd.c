@@ -232,8 +232,16 @@ struct __attribute__((packed)) dns_header
 
 static int lfd = -1;
 static WOLFSSL_CTX *wctx = NULL;
-/* sigset() is declared by <signal.h> on supported libc implementations.
- * Do not redeclare it: older Tomato/uClibc headers can disagree. */
+/* sigset() has incompatible or missing declarations across uClibc/glibc.
+ * Use POSIX sigaction() directly, rather than an implicit declaration. */
+static int dohd_set_signal(int signo, void (*handler)(int))
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handler;
+    sigemptyset(&sa.sa_mask);
+    return sigaction(signo, &sa, NULL);
+}
 
 struct req_slot {
     struct client_data *owner;
@@ -1289,14 +1297,13 @@ int main(int argc, char *argv[])
     }
     /* End command line parsing */
 
-    /* Set SIGUSR1 */
-    sigset(SIGUSR1, sig_stats);
-
-    /* Set SIGINT */
-    sigset(SIGINT, clean_exit);
-
-    /* Ignore SIGPIPE */
-    sigset(SIGPIPE, SIG_IGN);
+    /* Configure signals with a portable, explicitly declared API. */
+    if (dohd_set_signal(SIGUSR1, sig_stats) < 0 ||
+            dohd_set_signal(SIGINT, clean_exit) < 0 ||
+            dohd_set_signal(SIGPIPE, SIG_IGN) < 0) {
+        perror("Installing signal handlers");
+        return 1;
+    }
 
     /* Time 0 */
     DOH_Stats.start_time = time(NULL);
