@@ -232,9 +232,8 @@ struct __attribute__((packed)) dns_header
 
 static int lfd = -1;
 static WOLFSSL_CTX *wctx = NULL;
-#ifndef _MUSL_
-void *sigset(int sig, void (*disp)(int));
-#endif
+/* sigset() is declared by <signal.h> on supported libc implementations.
+ * Do not redeclare it: older Tomato/uClibc headers can disagree. */
 
 struct req_slot {
     struct client_data *owner;
@@ -256,6 +255,10 @@ struct client_data {
     struct evquick_event *ev_doh;
     int tls_handshake_done;
     int h2;
+    int handshake_want_write;
+    int tls_read_want_write;
+    int h2_send_blocked;
+    int h2_send_want_read;
     nghttp2_session *h2_session;
     int doh_sd;
     struct client_data *next;
@@ -267,6 +270,20 @@ static void dohd_reply(int fd, short __attribute__((unused)) revents,
 static void dohd_destroy_request(struct req_slot *req);
 
 struct client_data *Clients = NULL;
+
+/* Write readiness is needed only while wolfSSL has a pending operation.
+ * Do not monitor POLLOUT permanently: a writable socket would make the
+ * event loop busy-spin on an otherwise idle connection. */
+static void dohd_watch_client(struct client_data *cd)
+{
+    short events = EVQUICK_EV_READ;
+    if (!cd || !cd->ev_doh)
+        return;
+    if (cd->handshake_want_write || cd->tls_read_want_write ||
+            (cd->h2_send_blocked && !cd->h2_send_want_read))
+        events |= EVQUICK_EV_WRITE;
+    evquick_modevent(cd->ev_doh, events);
+}
 
 static void dohd_listen_error(int __attribute__((unused)) fd,
         short __attribute__((unused)) revents,
@@ -728,7 +745,15 @@ static void dohd_reply(int fd, short __attribute__((unused)) revents,
             return;
         }
 
-        nghttp2_session_send(req->owner->h2_session);
+        /* An nghttp2 send error is fatal for this HTTP/2 connection.
+         * Do not keep the session alive with failed pending frames. */
+        int send_ret = nghttp2_session_send(cd->h2_session);
+        if (send_ret < 0) {
+            dohprint(DOH_WARN, "H2: response send failed: %s (%d)",
+                    nghttp2_strerror(send_ret), send_ret);
+            dohd_destroy_client(cd);
+            return;
+        }
         /* Do not destroy request: not yet finished */
         DOH_Stats.tot_replies++;
         check_stats();
@@ -745,13 +770,28 @@ static ssize_t h2_cb_send(nghttp2_session *session, const uint8_t *data,
     struct client_data *cd = (struct client_data *)user_data;
     (void)session;
     (void)flags;
-    int ret;
-    ret = client_ssl_write(cd, data, length);
-
-    if (nghttp2_session_want_write(session)) {
-        nghttp2_session_send(session);
+    int ret = (int)client_ssl_write(cd, data, length);
+    if (ret > 0) {
+        cd->h2_send_blocked = 0;
+        cd->h2_send_want_read = 0;
+        dohd_watch_client(cd);
+        return ret;
     }
-    return ret;
+
+    /* wolfSSL reports WANT_READ / WANT_WRITE using a negative result.
+     * Returning that raw value to nghttp2 converts a recoverable condition
+     * into NGHTTP2_ERR_CALLBACK_FAILURE (-902). */
+    int ssl_error = wolfSSL_get_error(cd->ssl, ret);
+    if (ssl_error == WOLFSSL_ERROR_WANT_READ ||
+            ssl_error == WOLFSSL_ERROR_WANT_WRITE) {
+        cd->h2_send_blocked = 1;
+        cd->h2_send_want_read = (ssl_error == WOLFSSL_ERROR_WANT_READ);
+        dohd_watch_client(cd);
+        return NGHTTP2_ERR_WOULDBLOCK;
+    }
+    dohprint(DOH_WARN, "H2: wolfSSL_write failed: ssl_error=%d errno=%d",
+            ssl_error, errno);
+    return NGHTTP2_ERR_CALLBACK_FAILURE;
 }
 
 
@@ -825,10 +865,14 @@ static int h2_cb_on_stream_close(nghttp2_session *session, int32_t stream_id,
     struct client_data *cd = (struct client_data *)user_data;
     struct req_slot *req =
         nghttp2_session_get_stream_user_data(session, stream_id);
+    /* A stream may close after its request has already been released.
+     * A nonzero return here is a fatal nghttp2 callback failure (-902). */
     if (!req)
-        return -1;
-    if (cd != req->owner)
-        return -1;
+        return 0;
+    if (cd != req->owner) {
+        dohprint(DOH_WARN, "H2: stream %d closed with unexpected owner", stream_id);
+        return 0;
+    }
     (void)error_code;
     if (req)  {
         dohd_destroy_request(req);
@@ -899,11 +943,24 @@ static int h2_cb_on_header(nghttp2_session *session,
     return 0;
 }
 
+/* nghttp2_session_send() drains queued frames until blocked. Calling it
+ * recursively or repeatedly after an error can corrupt state or spin. */
+static int dohd_h2_flush(struct client_data *cd)
+{
+    int ret = nghttp2_session_send(cd->h2_session);
+    if (ret < 0) {
+        dohprint(DOH_WARN, "NGHTTP2 send error: %s (%d)",
+                nghttp2_strerror(ret), ret);
+        return -1;
+    }
+    return 0;
+}
+
 /**
  * Receive a request from the DoH client, forward to the DNS
- * server.
+ * server, or retry a blocked TLS write.
  */
-static void tls_read(__attribute__((unused)) int fd, short __attribute__((unused)) revents, void *arg)
+static void tls_read(__attribute__((unused)) int fd, short revents, void *arg)
 {
     uint8_t buff[DNS_BUFFER_MAXSIZE];
     int ret;
@@ -922,9 +979,13 @@ static void tls_read(__attribute__((unused)) int fd, short __attribute__((unused
         ret = wolfSSL_accept(cd->ssl);
         if (ret != SSL_SUCCESS) {
             int err = wolfSSL_get_error(cd->ssl, ret);
-            if (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE)
+            if (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE) {
+                cd->handshake_want_write = (err == WOLFSSL_ERROR_WANT_WRITE);
+                dohd_watch_client(cd);
                 return;
+            }
             dohd_destroy_client(cd);
+            return;
         } else {
             uint16_t proto_len;
             char *proto;
@@ -948,29 +1009,53 @@ static void tls_read(__attribute__((unused)) int fd, short __attribute__((unused
                 nghttp2_submit_settings(cd->h2_session, NGHTTP2_FLAG_NONE, iv, 1);
             }
             cd->tls_handshake_done = 1;
+            cd->handshake_want_write = 0;
+            dohd_watch_client(cd);
         }
         return;
     }
+    if (cd->h2 && cd->h2_send_blocked &&
+            ((cd->h2_send_want_read && (revents & EVQUICK_EV_READ)) ||
+             (!cd->h2_send_want_read && (revents & EVQUICK_EV_WRITE)))) {
+        if (dohd_h2_flush(cd) < 0) {
+            dohd_destroy_client(cd);
+            return;
+        }
+    }
+    if (!(revents & EVQUICK_EV_READ) &&
+            !(cd->tls_read_want_write && (revents & EVQUICK_EV_WRITE)))
+        return;
     /* Read the client data into our buff array */
     ret = wolfSSL_read(cd->ssl, buff, DNS_BUFFER_MAXSIZE);
     if (ret < 0) {
+        int err = wolfSSL_get_error(cd->ssl, ret);
+        if (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE) {
+            cd->tls_read_want_write = (err == WOLFSSL_ERROR_WANT_WRITE);
+            dohd_watch_client(cd);
+            return;
+        }
         dohd_destroy_client(cd);
         DOH_Stats.socket_errors++;
+        return;
     } else if (ret == 0) {
         dohd_destroy_client(cd);
+        return;
     } else {
+        cd->tls_read_want_write = 0;
+        dohd_watch_client(cd);
         if (cd->h2) {
             ssize_t readlen;
             readlen = nghttp2_session_mem_recv(cd->h2_session, buff, ret);
             if (readlen < 0) {
-                dohprint(DOH_WARN, "NGHTTP2 error: %s\n", nghttp2_strerror((int)readlen));
+                dohprint(DOH_WARN, "NGHTTP2 receive error: %s (%d)",
+                        nghttp2_strerror((int)readlen), (int)readlen);
+                dohd_destroy_client(cd);
                 return;
             }
-            while (nghttp2_session_want_write(cd->h2_session)) {
-                ret = nghttp2_session_send(cd->h2_session);
-                if (ret < 0) {
-                    dohprint(DOH_WARN, "NGHTTP2 error: %s\n", nghttp2_strerror((int)ret));
-                }
+            if (nghttp2_session_want_write(cd->h2_session) &&
+                    dohd_h2_flush(cd) < 0) {
+                dohd_destroy_client(cd);
+                return;
             }
         } else {
             if (ret < DNS_BUFFER_MAXSIZE)

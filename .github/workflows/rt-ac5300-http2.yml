@@ -1,0 +1,26 @@
+name: RT-AC5300 HTTP2 regression
+
+on:
+  push:
+    branches:
+      - fix/rt-ac5300-http2
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and HTTP2 testing dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwolfssl-dev libnghttp2-dev curl openssl
+      - name: Compile dohd
+        run: make -j2
+      - name: Verify version
+        run: ./src/dohd -V 2>&1 | grep '0.8'
+      - name: Test local DNS over HTTPS/2
+        run: sudo python3 test/rt_ac5300_h2_smoke.py

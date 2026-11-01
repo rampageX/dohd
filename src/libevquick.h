@@ -34,6 +34,7 @@ evquick_event *evquick_addevent(CTX ctx, int fd, short events,
                                 void *arg);
 
 void evquick_delevent(CTX ctx, evquick_event *e);
+void evquick_modevent(CTX ctx, evquick_event *e, short events);
 evquick_timer *evquick_addtimer(CTX ctx, unsigned long long interval, short flags,
                                 void (*callback)(CTX ctx, void *arg),
                                 void *arg);
@@ -96,6 +97,9 @@ evquick_event *evquick_addevent(int fd, short events,
  * Delete a previously created event.
  */
 void evquick_delevent(evquick_event *e);
+
+/* Change the read/write interest of a registered event. */
+void evquick_modevent(evquick_event *e, short events);
 
 
 /* Timer

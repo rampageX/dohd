@@ -195,6 +195,19 @@ evquick_event *evquick_addevent(int fd, short events,
 }
 
 #ifdef EVQUICK_PTHREAD
+void evquick_modevent(CTX ctx, evquick_event *e, short events)
+#else
+void evquick_modevent(evquick_event *e, short events)
+#endif
+{
+    if (!ctx || !e || e->events == events)
+        return;
+    e->events = events;
+    ctx->changed = 1;
+    LOOP_BREAK();
+}
+
+#ifdef EVQUICK_PTHREAD
 void evquick_delevent(CTX ctx, evquick_event *e)
 #else
 void evquick_delevent(evquick_event *e)
