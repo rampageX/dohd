@@ -1,0 +1,29 @@
+name: RT-AC5300 upstream integration regression
+
+on:
+  push:
+    branches:
+      - integration/rt-ac5300-upstream
+      - fix/rt-ac5300-http2
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-build-unit-and-doh:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwolfssl-dev libnghttp2-dev curl openssl
+      - name: Build all upstream components
+        run: make -j2
+      - name: Verify CLI version
+        run: ./src/dohd -V 2>&1 | grep '0.8'
+      - name: Exercise upstream memory-pool and HTTP2 unit tests
+        run: make -C test check VERSION=0.8
+      - name: HTTP2 DNS resolution and callback regression
+        run: sudo python3 test/rt_ac5300_h2_smoke.py

@@ -5,8 +5,6 @@ LDFLAGS:=-lwolfssl -lrt -lm -lnghttp2
 CFLAGS := -I../src -O0 -ggdb -Wall -Wextra -Wno-sign-compare \
  -DVERSION=\"${VERSION}\" -fPIE -Wno-unused-function
 
-CFLAGS += $(if $(shell ldd /bin/ls | grep 'musl' | head -1 | cut -d ' ' -f1), -D_MUSL_,)
-
 # Default target: build all unit tests
 all: dohd_url64_test dohd_url64_extended_test dohd_heap_test dohd_dns_parser_test dohd_mempool_test dohd_h2_session_test
 

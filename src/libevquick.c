@@ -215,6 +215,29 @@ evquick_event *evquick_addevent(int fd, short events,
 }
 
 #ifdef EVQUICK_PTHREAD
+int evquick_modevent(CTX ctx, evquick_event *e, short events)
+#else
+int evquick_modevent(evquick_event *e, short events)
+#endif
+{
+    struct epoll_event ev = {0};
+    if (!ctx || !e || !e->valid)
+        return -1;
+    if (e->events == events)
+        return 0;
+    ev.events = EPOLLHUP | EPOLLERR;
+    if (events & EVQUICK_EV_READ)
+        ev.events |= EPOLLIN;
+    if (events & EVQUICK_EV_WRITE)
+        ev.events |= EPOLLOUT;
+    ev.data.ptr = e;
+    if (epoll_ctl(ctx->epfd, EPOLL_CTL_MOD, e->fd, &ev) < 0)
+        return -1;
+    e->events = events;
+    return 0;
+}
+
+#ifdef EVQUICK_PTHREAD
 void evquick_delevent(CTX ctx, evquick_event *e)
 #else
 void evquick_delevent(evquick_event *e)

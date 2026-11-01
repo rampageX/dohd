@@ -6,11 +6,7 @@
 #ifndef __LIBEVQUICK
 #define __LIBEVQUICK
 
-#ifndef _MUSL_
-#include <sys/poll.h>
-#else
 #include <poll.h>
-#endif
 
 #define EVQUICK_EV_READ POLLIN
 #define EVQUICK_EV_WRITE POLLOUT
@@ -34,6 +30,7 @@ evquick_event *evquick_addevent(CTX ctx, int fd, short events,
                                 void *arg);
 
 void evquick_delevent(CTX ctx, evquick_event *e);
+int evquick_modevent(CTX ctx, evquick_event *e, short events);
 evquick_timer *evquick_addtimer(CTX ctx, unsigned long long interval, short flags,
                                 void (*callback)(CTX ctx, void *arg),
                                 void *arg);
@@ -96,6 +93,9 @@ evquick_event *evquick_addevent(int fd, short events,
  * Delete a previously created event.
  */
 void evquick_delevent(evquick_event *e);
+
+/* Update EPOLLIN/EPOLLOUT interest for an existing socket. */
+int evquick_modevent(evquick_event *e, short events);
 
 
 /* Timer
