@@ -1,8 +1,9 @@
-name: RT-AC5300 upstream integration regression
+name: DoHD build, HTTP/2 and ODoH regression
 
 on:
   push:
     branches:
+      - master
       - integration/rt-ac5300-upstream
       - fix/rt-ac5300-http2
   workflow_dispatch:
