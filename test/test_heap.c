@@ -266,6 +266,13 @@ static int test_heap_id_wrap(void) {
 /* The former heap_delete sorted adjacent array entries instead of repairing
  * the parent/child invariant. Random cancellations must preserve both the
  * heap property and the identity of every surviving timer. */
+/* Avoid printing hundreds of thousands of individual passing checks. */
+#define MIXED_CHECK(cond, message) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "mixed heap test failed at line %d: %s\n", __LINE__, message); \
+        TEST_ASSERT(0, message); \
+    } \
+} while (0)
 static int test_heap_mixed_cancel(void) {
     enum { N = 128, ROUNDS = 200 };
     uint32_t rng = 0x4f3ab921U;
@@ -282,21 +289,21 @@ static int test_heap_mixed_cancel(void) {
                 test_timer t = { .expire = rng % 4096U, .value = (int)slot };
                 ids[slot] = heap_insert(h, &t);
                 deadlines[slot] = t.expire;
-                TEST_ASSERT(ids[slot] >= 0, "mixed: insert");
+                MIXED_CHECK(ids[slot] >= 0, "mixed: insert");
                 alive[slot] = 1;
                 count++;
             } else {
-                TEST_ASSERT(heap_delete(h, ids[slot]) == 0, "mixed: cancel");
+                MIXED_CHECK(heap_delete(h, ids[slot]) == 0, "mixed: cancel");
                 alive[slot] = 0;
                 count--;
             }
-            TEST_ASSERT(h->n == (unsigned)count, "mixed: count");
+            MIXED_CHECK(h->n == (unsigned)count, "mixed: count");
             for (unsigned i = 2; i <= h->n; i++) {
                 if (h->top[i / 2].data.expire > h->top[i].data.expire) {
                     fprintf(stderr, "heap invariant broken at round=%d step=%d index=%u\n",
                             round, step, i);
                     heap_destroy(h);
-                    TEST_ASSERT(0, "mixed: heap invariant");
+                    MIXED_CHECK(0, "mixed: heap invariant");
                 }
             }
             if (count > 0 && (step % 7) == 0) {
@@ -305,10 +312,10 @@ static int test_heap_mixed_cancel(void) {
                 for (int j = 0; j < N; j++)
                     if (alive[j] && deadlines[j] < min)
                         min = deadlines[j];
-                TEST_ASSERT(heap_peek(h, &t) == 0, "mixed: pop");
-                TEST_ASSERT(t.value >= 0 && t.value < N && alive[t.value],
+                MIXED_CHECK(heap_peek(h, &t) == 0, "mixed: pop");
+                MIXED_CHECK(t.value >= 0 && t.value < N && alive[t.value],
                             "mixed: returned live timer");
-                TEST_ASSERT(t.expire == min && t.expire == deadlines[t.value],
+                MIXED_CHECK(t.expire == min && t.expire == deadlines[t.value],
                             "mixed: earliest deadline");
                 alive[t.value] = 0;
                 count--;
@@ -317,19 +324,22 @@ static int test_heap_mixed_cancel(void) {
         unsigned long long last = 0;
         while (h->n) {
             test_timer t;
-            TEST_ASSERT(heap_peek(h, &t) == 0, "mixed: final drain");
-            TEST_ASSERT(t.expire >= last, "mixed: sorted final drain");
-            TEST_ASSERT(t.value >= 0 && t.value < N && alive[t.value],
+            MIXED_CHECK(heap_peek(h, &t) == 0, "mixed: final drain");
+            MIXED_CHECK(t.expire >= last, "mixed: sorted final drain");
+            MIXED_CHECK(t.value >= 0 && t.value < N && alive[t.value],
                         "mixed: no cancelled or duplicate timer");
             alive[t.value] = 0;
             last = t.expire;
             count--;
         }
-        TEST_ASSERT(count == 0, "mixed: all live timers drained");
+        MIXED_CHECK(count == 0, "mixed: all live timers drained");
         heap_destroy(h);
     }
+    TEST_ASSERT(1, "mixed: 200 rounds of insertion, cancellation, expiration and final drain");
     return 1;
 }
+
+#undef MIXED_CHECK
 
 int main(int argc, char **argv) {
     (void)argc;
