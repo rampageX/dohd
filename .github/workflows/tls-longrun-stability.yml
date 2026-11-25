@@ -1,0 +1,71 @@
+name: Isolated DoHD TLS and long-run stability comparison
+
+on:
+  push:
+    branches: [fix/tls-longrun-stability]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dohd-stability-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stability:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [native, armv5te]
+        wolfssl: ['5.1.0', '5.9.4']
+    env:
+      BUILD_ROOT: /tmp/dohd-stability
+      JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool pkg-config \
+            ca-certificates curl git file binutils xz-utils \
+            openssl python3-h2 qemu-user
+      - name: Install pinned soft-float musl ARM toolchain
+        if: matrix.arch == 'armv5te'
+        run: |
+          curl -fL --retry 4 --connect-timeout 30 \
+            -o "$RUNNER_TEMP/gcc-arm-linux-musleabi.tar.gz" \
+            https://github.com/prepkg/gcc-toolchain/releases/download/1.0.0-beta/gcc-arm-linux-musleabi.tar.gz
+          echo '52b152e6cefdd23ff7a527fd485bffc8d0152e76fa9b01a9d5c11f344e5c5b01  '"$RUNNER_TEMP/gcc-arm-linux-musleabi.tar.gz" | sha256sum -c -
+          sudo tar --no-same-owner -xzf "$RUNNER_TEMP/gcc-arm-linux-musleabi.tar.gz" -C /opt
+          echo /opt/arm-linux-musleabi/bin >> "$GITHUB_PATH"
+      - name: Timer heap regression
+        run: |
+          bash -n ci/build-stability.sh
+          python3 -m py_compile test/rt_ac5300_longrun.py
+          make -C test dohd_heap_test
+          ./test/dohd_heap_test
+      - name: Build isolated static candidate
+        run: |
+          bash ci/build-stability.sh '${{ matrix.arch }}' '${{ matrix.wolfssl }}'
+      - name: Offline DNS, HTTP2, TLS resumption and timeout stress
+        shell: bash
+        run: |
+          binary="$BUILD_ROOT/${{ matrix.arch }}-wolfssl-${{ matrix.wolfssl }}/dist/dohd_${{ matrix.arch }}_wolfssl_${{ matrix.wolfssl }}"
+          if [[ '${{ matrix.arch }}' == armv5te ]]; then
+            qemu-arm -cpu arm926 "$binary" -V
+            sudo /usr/bin/python3 test/rt_ac5300_longrun.py "$binary" --arm
+          else
+            "$binary" -V
+            sudo /usr/bin/python3 test/rt_ac5300_longrun.py "$binary"
+          fi
+      - name: Upload verified candidate and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: dohd-${{ matrix.arch }}-wolfssl-${{ matrix.wolfssl }}
+          path: /tmp/dohd-stability/${{ matrix.arch }}-wolfssl-${{ matrix.wolfssl }}/dist/
+          if-no-files-found: error
+          retention-days: 14
