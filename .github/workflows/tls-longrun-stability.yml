@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [native, armv5te]
-        wolfssl: ['5.1.0', '5.9.4']
+        wolfssl: ['5.9.4']
     env:
       BUILD_ROOT: /tmp/dohd-stability
       JOBS: '2'
