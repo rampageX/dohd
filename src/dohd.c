@@ -1853,22 +1853,23 @@ int main(int argc, char *argv[])
             verify_always_ok);
     }
 
-    /* Preserve the normal default; use this opt-in for controlled A/B tests.
+    /* Prefer full handshakes for the stability candidate. Re-enable the old
+     * cache/ticket policy explicitly with DOHD_DISABLE_TLS_RESUMPTION=0.
      * TLS 1.3 needs its own ticket-disable API, not SSL_OP_NO_TICKET. */
     const char *no_resume = getenv("DOHD_DISABLE_TLS_RESUMPTION");
     dohprint(LOG_NOTICE, "wolfSSL headers: %s", LIBWOLFSSL_VERSION_STRING);
-    if (no_resume && strcmp(no_resume, "1") == 0) {
+    if (!no_resume || strcmp(no_resume, "0") != 0) {
         int ticket_ret = wolfSSL_CTX_no_ticket_TLSv13(wctx);
         if (ticket_ret != 0) {
             dohprint(DOH_ERR, "Cannot disable TLS 1.3 tickets: %d", ticket_ret);
             return -1;
         }
         wolfSSL_CTX_set_session_cache_mode(wctx, WOLFSSL_SESS_CACHE_OFF);
-        dohprint(LOG_NOTICE, "TLS session resumption disabled (diagnostic mode)");
+        dohprint(LOG_NOTICE, "TLS session resumption disabled (stability default)");
     } else {
         wolfSSL_CTX_set_session_cache_mode(wctx, WOLFSSL_SESS_CACHE_SERVER);
         wolfSSL_CTX_set_timeout(wctx, 3600);
-        dohprint(LOG_NOTICE, "TLS session resumption enabled");
+        dohprint(LOG_NOTICE, "TLS session resumption permitted (ticket availability depends on wolfSSL configuration)");
     }
 
     if (wolfSSL_CTX_use_certificate_chain_file(wctx, cert) != SSL_SUCCESS) {
