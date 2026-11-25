@@ -85,7 +85,7 @@ static inline int heap_delete(struct heap_##type *heap, int id)                 
 {                                                                                       \
     int found = 0;                                                                      \
     int i;                                                                       \
-    struct heap_element_##type *last, temp;                                             \
+    struct heap_element_##type temp;                                             \
     errno = 0;                                                                          \
     if (heap->n == 0) {                                                                 \
         errno = ENOENT;                                                                 \
@@ -109,15 +109,26 @@ static inline int heap_delete(struct heap_##type *heap, int id)                 
         heap->n--;                                                                      \
         return 0;                                                                       \
     }                                                                                   \
-    last = &heap->top[heap->n--];                                                       \
-    memcpy(&heap->top[found], last, sizeof(struct heap_element_##type));                \
-    for(i = found; i < heap->n; i++) {                                                  \
-        if (heap->top[i].data.orderby > heap->top[i + 1].data.orderby) {                \
-            memcpy(&temp, &heap->top[i], sizeof(struct heap_element_##type));           \
-            memcpy(&heap->top[i], &heap->top[i+1], sizeof(struct heap_element_##type)); \
-            memcpy(&heap->top[i+1], &temp, sizeof(struct heap_element_##type));         \
-        }                                                                               \
-    }                                                                                   \
+    /* Move the last element into the hole and restore heap order. */                  \
+    temp = heap->top[heap->n--];                                                       \
+    i = found;                                                                         \
+    if (i > 1 && temp.data.orderby < heap->top[i / 2].data.orderby) {                  \
+        for (; i > 1 && temp.data.orderby < heap->top[i / 2].data.orderby;             \
+                i /= 2)                                                                \
+            heap->top[i] = heap->top[i / 2];                                           \
+    } else {                                                                           \
+        int child;                                                                     \
+        for (; 2 * i <= heap->n; i = child) {                                          \
+            child = 2 * i;                                                             \
+            if (child < heap->n && heap->top[child + 1].data.orderby <                 \
+                    heap->top[child].data.orderby)                                     \
+                child++;                                                               \
+            if (temp.data.orderby <= heap->top[child].data.orderby)                    \
+                break;                                                                 \
+            heap->top[i] = heap->top[child];                                           \
+        }                                                                              \
+    }                                                                                  \
+    heap->top[i] = temp;                                                               \
     return 0;                                                                           \
 } \
 static inline type *heap_first(heap_##type *heap)                                       \
