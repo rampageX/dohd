@@ -313,6 +313,7 @@ struct req_slot {
     int owner_fd;                   /* Client fd for safe lookup after owner may be freed */
     struct evquick_event *ev_dns;
     evquick_timer *timeout_timer;   /* Request timeout timer */
+    int counted_pending;            /* Exactly one decrement after forwarding */
     int dns_sd;
     uint32_t h2_stream_id;
     uint8_t h2_request_buffer[DNS_BUFFER_MAXSIZE];
@@ -347,6 +348,7 @@ struct client_data {
 static void dohd_reply(int fd, short __attribute__((unused)) revents,
         void *arg);
 static void dohd_destroy_request(struct req_slot *req);
+static int dohd_h2_flush(struct client_data *cd);
 
 /* EPOLLOUT is nearly always ready. Watch it only when TLS needs a write
  * retry, otherwise idle DoH connections would busy-spin. */
@@ -528,7 +530,7 @@ static void dohd_destroy_client(struct client_data *cd)
             evquick_delevent(rp->ev_dns);
             rp->ev_dns = NULL;
         }
-        if (rp->dns_sd > 0)
+        if (rp->dns_sd >= 0)
             close(rp->dns_sd);
         if (rp->h2_response_data) {
             DOH_Stats.mem -= rp->h2_response_len;
@@ -536,10 +538,10 @@ static void dohd_destroy_client(struct client_data *cd)
             rp->h2_response_data = NULL;
         }
         nxt = rp->next;
+        if (rp->counted_pending && DOH_Stats.pending_requests > 0)
+            DOH_Stats.pending_requests--;
         mempool_free(request_pool, rp);
         DOH_Stats.mem -= sizeof(struct req_slot);
-        if (DOH_Stats.pending_requests > 0)
-            DOH_Stats.pending_requests--;
         rp = nxt;
     }
     /* Remove events from file desc */
@@ -585,7 +587,7 @@ static void clean_exit(int __attribute__((unused)) signo)
                     evquick_deltimer(rp->timeout_timer);
                 if (rp->ev_dns)
                     evquick_delevent(rp->ev_dns);
-                if (rp->dns_sd > 0)
+                if (rp->dns_sd >= 0)
                     close(rp->dns_sd);
                 if (rp->h2_response_data)
                     free(rp->h2_response_data);
@@ -657,12 +659,15 @@ struct req_slot *dns_create_request_h2(struct client_data *cd, uint32_t stream_i
         return NULL;
     }
 
-    /* Set socket receive timeout to complement timer-based timeout.
-     * This ensures recv() won't block indefinitely if the event loop
-     * callback fires but data isn't immediately available. */
-    struct timeval tv = { .tv_sec = DNS_REQUEST_TIMEOUT_MS / 1000,
-                          .tv_usec = (DNS_REQUEST_TIMEOUT_MS % 1000) * 1000 };
-    setsockopt(req->dns_sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    /* Never block the shared event loop on a single upstream UDP socket. */
+    int socket_flags = fcntl(req->dns_sd, F_GETFL, 0);
+    if (socket_flags < 0 ||
+            fcntl(req->dns_sd, F_SETFL, socket_flags | O_NONBLOCK) < 0) {
+        dohprint(DOH_ERR, "Cannot set nonblocking DNS socket: %s", strerror(errno));
+        close(req->dns_sd);
+        mempool_free(request_pool, req);
+        return NULL;
+    }
 
     /* append to list */
     req->next = cd->list;
@@ -688,33 +693,27 @@ struct req_slot *dns_create_request_h2(struct client_data *cd, uint32_t stream_i
 /* Timeout callback - upstream DNS didn't respond in time */
 static void dns_request_timeout(void *arg)
 {
-    struct req_slot *req = (struct req_slot *)arg;
-    struct client_data *cd;
-    nghttp2_session *session;
+    struct req_slot *req = arg;
+    struct client_data *cd = client_hash_lookup(req->owner_fd);
+    nghttp2_session *session = (cd && cd == req->owner) ? cd->h2_session : NULL;
+    int submitted = 0;
 
     DOH_Stats.socket_errors++;
 
-    /* Use owner_fd to safely look up if client still exists without
-     * dereferencing the potentially-freed owner pointer.
-     * Note: This is single-threaded, so no race between lookup and use. */
-    cd = client_hash_lookup(req->owner_fd);
-    if (cd && cd == req->owner) {
-        /* Capture session pointer after validation */
-        session = cd->h2_session;
-        if (session) {
-            /* Send HTTP 504 Gateway Timeout to client */
-            nghttp2_nv nva[] = {
-                MAKE_NV(":status", "504"),
-                MAKE_NV("server", "dohd"),
-            };
-            nghttp2_submit_response(session, req->h2_stream_id, nva, 2, NULL);
-            nghttp2_session_send(session);
-        }
-    }
-
-    /* Timer already fired, clear it before destroy */
+    /* The one-shot timer has been removed from the heap already.
+     * A session_send may synchronously invoke on_stream_close and free req.
+     * Detach and release the request BEFORE flushing the header-only 504. */
     req->timeout_timer = NULL;
+    if (session) {
+        nghttp2_nv nva[] = {
+            MAKE_NV(":status", "504"),
+            MAKE_NV("server", "dohd"),
+        };
+        submitted = nghttp2_submit_response(session, req->h2_stream_id, nva, 2, NULL);
+    }
     dohd_destroy_request(req);
+    if (session && (submitted < 0 || dohd_h2_flush(cd) < 0))
+        dohd_destroy_client(cd);
 }
 
 static int dns_send_request_h2(struct req_slot *req)
@@ -724,21 +723,31 @@ static int dns_send_request_h2(struct req_slot *req)
     uint16_t plain_len = 0;
     struct dns_header *hdr;
     if (oblivion_mode) {
-        if (!req->is_odoh)
+        if (!req->is_odoh) {
+            dohd_destroy_request(req);
             return -1;
+        }
         if (odoh_target_decrypt_query(&odoh_target,
                 req->h2_request_buffer, (uint16_t)req->h2_request_len,
                 plain_dns, &plain_len, &req->odoh_ctx) != 0) {
+            dohd_destroy_request(req);
             return -1;
         }
-        if (plain_len > sizeof(req->h2_request_buffer))
+        if (plain_len > sizeof(req->h2_request_buffer)) {
+            dohd_destroy_request(req);
             return -1;
+        }
         memcpy(req->h2_request_buffer, plain_dns, plain_len);
         req->h2_request_len = plain_len;
     }
     /* Parse DNS header: only check the qr flag. */
+    if (req->h2_request_len < sizeof(struct dns_header)) {
+        dohd_destroy_request(req);
+        return -1;
+    }
     hdr = (struct dns_header *)req->h2_request_buffer;
     if (hdr->qr != 0) {
+        dohd_destroy_request(req);
         return -1;
     }
     req->ev_dns = evquick_addevent(req->dns_sd, EVQUICK_EV_READ, dohd_reply,
@@ -763,7 +772,14 @@ static int dns_send_request_h2(struct req_slot *req)
     /* Start timeout timer - if upstream doesn't respond, return 504 */
     req->timeout_timer = evquick_addtimer(DNS_REQUEST_TIMEOUT_MS, 0,
             dns_request_timeout, req);
+    if (!req->timeout_timer) {
+        dohprint(DOH_ERR, "Cannot schedule DNS request timeout");
+        DOH_Stats.socket_errors++;
+        dohd_destroy_request(req);
+        return -1;
+    }
 
+    req->counted_pending = 1;
     DOH_Stats.pending_requests++;
     DOH_Stats.tot_requests++;
     check_stats();
@@ -929,7 +945,10 @@ static void dohd_destroy_request(struct req_slot *req)
         evquick_delevent(req->ev_dns);
         req->ev_dns = NULL;
     }
-    close(req->dns_sd);
+    if (req->dns_sd >= 0) {
+        close(req->dns_sd);
+        req->dns_sd = -1;
+    }
     if (req->h2_response_data) {
         DOH_Stats.mem -= req->h2_response_len;
         free(req->h2_response_data);
@@ -940,11 +959,11 @@ static void dohd_destroy_request(struct req_slot *req)
         nghttp2_session_set_stream_user_data(cd->h2_session,
                 req->h2_stream_id, NULL);
     }
+    if (req->counted_pending && DOH_Stats.pending_requests > 0)
+        DOH_Stats.pending_requests--;
     mempool_free(request_pool, req);
     /* Update statistics */
     DOH_Stats.mem -= sizeof(struct req_slot);
-    if (DOH_Stats.pending_requests > 0)
-        DOH_Stats.pending_requests--;
     check_stats();
 }
 
@@ -999,16 +1018,24 @@ static void dohd_reply(int fd, short __attribute__((unused)) revents,
     req = (struct req_slot *)arg;
     cd = req->owner;
 
-    /* Cancel timeout timer - we got a response */
+    len = recv(fd, buff, bufsz, 0);
+    if (len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+        return; /* Keep the original timeout armed. */
+    if (len < 16)
+        goto destroy;
+
+    /* The response is owned by the HTTP/2 stream now. No further UDP
+     * callbacks may act on this slot while its TLS write is pending. */
     if (req->timeout_timer) {
         evquick_deltimer(req->timeout_timer);
         req->timeout_timer = NULL;
     }
-
-    len = recv(fd, buff, bufsz, 0);
-    if (len < 16) {
-        goto destroy;
+    if (req->ev_dns) {
+        evquick_delevent(req->ev_dns);
+        req->ev_dns = NULL;
     }
+    close(req->dns_sd);
+    req->dns_sd = -1;
 
     /* Safety check: client data object must still be in hash table,
      * or it may have been previously freed and thus is invalid.
