@@ -87,15 +87,27 @@ rm -rf dnsperf-2.16.0; tar -xzf dnsperf-2.16.0.tar.gz
     export LIBS="-latomic -pthread -lm"
     # LDNS is optional and only needed for dynamic updates.
     ./configure --host=arm-linux-musleabi --prefix="$PREFIX" --disable-shared --enable-static
-    make -C src -j"$JOBS" dnsperf
-    cp src/dnsperf "$ROOT/dist/dnsperf_armv5te_static_2.16.0"
+    make -C src -j"$JOBS" V=1 LDFLAGS="-L$PREFIX/lib -all-static" dnsperf
+    cp src/dnsperf "$ROOT/dist/dnsperf_armv5te_static_2.16.0.tmp"
 )
 bin="$ROOT/dist/dnsperf_armv5te_static_2.16.0"
-"$STRIP" "$bin"
-file "$bin"
-readelf -h -l -A "$bin" > "$bin.elf.txt"
-! grep -Eq 'INTERP|DYNAMIC' "$bin.elf.txt"
-grep -Eq 'Tag_CPU_arch: v5TE([[:space:]]|$)' "$bin.elf.txt"
-! grep -q 'Tag_ABI_VFP_args: VFP registers' "$bin.elf.txt"
+tmp="$bin.tmp"
+"$STRIP" "$tmp"
+file "$tmp"
+readelf -h -l -A -W "$tmp" > "$tmp.elf.txt"
+if grep -Eq 'INTERP|DYNAMIC' "$tmp.elf.txt"; then
+    echo "ERROR: dnsperf is not fully static" >&2
+    exit 1
+fi
+if ! grep -Eq 'Tag_CPU_arch: v5TE([[:space:]]|$)' "$tmp.elf.txt"; then
+    echo "ERROR: expected ARMv5TE" >&2
+    exit 1
+fi
+if grep -q 'Tag_ABI_VFP_args: VFP registers' "$tmp.elf.txt"; then
+    echo "ERROR: unexpected hard-float ABI" >&2
+    exit 1
+fi
+mv "$tmp" "$bin"
+mv "$tmp.elf.txt" "$bin.elf.txt"
 (cd "$ROOT/dist"; sha256sum "$(basename "$bin")" > SHA256SUMS)
 printf 'dnsperf=2.16.0\nopenssl=3.5.9\nnghttp2=1.68.0\nck=0.7.2 (compiler atomics)\njson-c=0.18\narch=ARMv5TE soft-float musl\nLDNS=disabled\n' > "$ROOT/dist/BUILD-INFO.txt"
