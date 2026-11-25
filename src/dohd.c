@@ -33,6 +33,10 @@
 #include <syslog.h>
 #include <pwd.h>
 #include <time.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wolfssl/version.h>
 #include "libevquick.h"
 #include "url64.h"
 #include "mempool.h"
@@ -124,6 +128,7 @@ static struct doh_stats {
     uint64_t http2_get_requests;
     uint64_t socket_errors;
     uint64_t pool_exhausted;
+    uint64_t tls_handshake_failures;
 
     /* Memory (current, peak) */
     uint64_t mem;
@@ -233,6 +238,7 @@ static void printstats(void)
     dohprint(LOG_NOTICE, "    - Invalid HTTP requests: %" PRIu64, DOH_Stats.http_notvalid_requests);
     dohprint(LOG_NOTICE, "    - Socket errors: %" PRIu64, DOH_Stats.socket_errors);
     dohprint(LOG_NOTICE, "    - Pool exhausted: %" PRIu64, DOH_Stats.pool_exhausted);
+    dohprint(LOG_NOTICE, "    - TLS handshake failures: %" PRIu64, DOH_Stats.tls_handshake_failures);
     dohprint(LOG_NOTICE, "- Memory usage:");
     dohprint(LOG_NOTICE, "    - Current: %" PRIu64 " Bytes, peak: %" PRIu64 " Bytes",
             DOH_Stats.mem, DOH_Stats.mem_peak);
@@ -260,6 +266,27 @@ struct __attribute__((packed)) dns_header
     uint16_t arcount;   /* Additional count */
 };
 #define DNSQ_SUFFIX_LEN (4)
+
+static void log_tls_error(int level, const char *stage, WOLFSSL *ssl,
+        int ret, int err, int saved_errno)
+{
+    WOLFSSL_ALERT_HISTORY alerts = {0};
+    char reason[128] = {0};
+    unsigned long queued = 0;
+    char queue_reason[128] = {0};
+    wolfSSL_get_alert_history(ssl, &alerts);
+    wolfSSL_ERR_error_string_n((unsigned long)(long)err, reason, sizeof(reason));
+#if defined(OPENSSL_EXTRA) || defined(OPENSSL_ALL)
+    queued = wolfSSL_ERR_peek_error();
+    if (queued)
+        wolfSSL_ERR_error_string_n(queued, queue_reason, sizeof(queue_reason));
+#endif
+    dohprint(level, "TLS %s failed: ret=%d error=%d (%s) errno=%d (%s) "
+            "alert_rx=%d/%d alert_tx=%d/%d queue=%lu (%s)",
+            stage, ret, err, reason, saved_errno, strerror(saved_errno),
+            alerts.last_rx.level, alerts.last_rx.code,
+            alerts.last_tx.level, alerts.last_tx.code, queued, queue_reason);
+}
 
 static int lfd = -1;
 static WOLFSSL_CTX *wctx = NULL;
@@ -1055,7 +1082,9 @@ static ssize_t h2_cb_send(nghttp2_session *session, const uint8_t *data,
     struct client_data *cd = (struct client_data *)user_data;
     (void)session;
     (void)flags;
+    errno = 0;
     int ret = (int)client_ssl_write(cd, data, length);
+    int saved_errno = errno;
     if (ret > 0) {
         cd->h2_send_blocked = 0;
         cd->h2_send_want_read = 0;
@@ -1073,8 +1102,7 @@ static ssize_t h2_cb_send(nghttp2_session *session, const uint8_t *data,
         dohd_watch_client(cd);
         return NGHTTP2_ERR_WOULDBLOCK;
     }
-    dohprint(DOH_WARN, "H2: wolfSSL_write failed: ssl_error=%d errno=%d",
-            ssl_error, errno);
+    log_tls_error(DOH_WARN, "write", cd->ssl, ret, ssl_error, saved_errno);
     return NGHTTP2_ERR_CALLBACK_FAILURE;
 }
 
@@ -1284,26 +1312,29 @@ static void tls_read(__attribute__((unused)) int fd, short revents, void *arg)
         return;
     if (!cd->tls_handshake_done) {
         /* Establish TLS connection */
+        errno = 0;
         ret = wolfSSL_accept(cd->ssl);
         if (ret != SSL_SUCCESS) {
+            int saved_errno = errno;
             int err = wolfSSL_get_error(cd->ssl, ret);
             if (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE) {
                 cd->handshake_want_write = (err == WOLFSSL_ERROR_WANT_WRITE);
                 dohd_watch_client(cd);
                 return;
             }
-            dohprint(DOH_DEBUG, "TLS handshake failed: error %d", err);
+            DOH_Stats.tls_handshake_failures++;
+            log_tls_error(DOH_DEBUG, "handshake", cd->ssl, ret, err, saved_errno);
             dohd_destroy_client(cd);
             return;
         } else {
-            uint16_t proto_len;
-            char *proto;
+            uint16_t proto_len = 0;
+            char *proto = NULL;
             if (oblivion_mode && !proxy_auth_peer_allowed(cd->ssl, &proxy_set)) {
                 dohd_destroy_client(cd);
                 return;
             }
-            if (wolfSSL_ALPN_GetProtocol(cd->ssl, &proto, &proto_len) &&
-                    (2 == proto_len) && strncmp(proto, "h2", 2) == 0) {
+            if (wolfSSL_ALPN_GetProtocol(cd->ssl, &proto, &proto_len) == SSL_SUCCESS &&
+                    proto && (2 == proto_len) && strncmp(proto, "h2", 2) == 0) {
                 nghttp2_settings_entry iv[1] = {
                     {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}
                 };
@@ -1339,14 +1370,17 @@ static void tls_read(__attribute__((unused)) int fd, short revents, void *arg)
             !(cd->tls_read_want_write && (revents & EVQUICK_EV_WRITE)))
         return;
     /* Read the client data into our buff array */
+    errno = 0;
     ret = wolfSSL_read(cd->ssl, buff, DNS_BUFFER_MAXSIZE);
     if (ret < 0) {
+        int saved_errno = errno;
         int err = wolfSSL_get_error(cd->ssl, ret);
         if (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE) {
             cd->tls_read_want_write = (err == WOLFSSL_ERROR_WANT_WRITE);
             dohd_watch_client(cd);
             return;
         }
+        log_tls_error(DOH_DEBUG, "read", cd->ssl, ret, err, saved_errno);
         dohd_destroy_client(cd);
         DOH_Stats.socket_errors++;
         return;
@@ -1439,7 +1473,13 @@ static void dohd_new_connection(int __attribute__((unused)) fd,
     setsockopt(connd, SOL_SOCKET, SO_REUSEADDR, (char *) &yes, sizeof(int));
 
     /* Set socket to non-blocking for async TLS handshake */
-    fcntl(connd, F_SETFL, fcntl(connd, F_GETFL, 0) | O_NONBLOCK);
+    int socket_flags = fcntl(connd, F_GETFL, 0);
+    if (socket_flags < 0 || fcntl(connd, F_SETFL, socket_flags | O_NONBLOCK) < 0) {
+        dohprint(DOH_WARN, "Cannot set nonblocking client socket: %s", strerror(errno));
+        close(connd);
+        mempool_free(client_pool, cd);
+        return;
+    }
 
     /* Create a WOLFSSL object */
     cd->ssl = wolfSSL_new(wctx);
@@ -1455,7 +1495,13 @@ static void dohd_new_connection(int __attribute__((unused)) fd,
         dohprint(DOH_WARN, "WARNING: failed setting ALPN extension for http/2");
     }
     /* Attach wolfSSL to the socket */
-    wolfSSL_set_fd(cd->ssl, connd);
+    if (wolfSSL_set_fd(cd->ssl, connd) != SSL_SUCCESS) {
+        dohprint(DOH_ERR, "Cannot attach TLS socket");
+        wolfSSL_free(cd->ssl);
+        close(connd);
+        mempool_free(client_pool, cd);
+        return;
+    }
 
 
     cd->doh_sd = connd;
@@ -1780,10 +1826,23 @@ int main(int argc, char *argv[])
             verify_always_ok);
     }
 
-    /* Enable session tickets for faster reconnection (1-RTT resume) */
-    wolfSSL_CTX_set_session_cache_mode(wctx, WOLFSSL_SESS_CACHE_SERVER);
-    wolfSSL_CTX_set_timeout(wctx, 3600);  /* 1 hour session timeout */
-    dohprint(DOH_DEBUG, "TLS session tickets enabled");
+    /* Preserve the normal default; use this opt-in for controlled A/B tests.
+     * TLS 1.3 needs its own ticket-disable API, not SSL_OP_NO_TICKET. */
+    const char *no_resume = getenv("DOHD_DISABLE_TLS_RESUMPTION");
+    dohprint(LOG_NOTICE, "wolfSSL headers: %s", LIBWOLFSSL_VERSION_STRING);
+    if (no_resume && strcmp(no_resume, "1") == 0) {
+        int ticket_ret = wolfSSL_CTX_no_ticket_TLSv13(wctx);
+        if (ticket_ret != 0) {
+            dohprint(DOH_ERR, "Cannot disable TLS 1.3 tickets: %d", ticket_ret);
+            return -1;
+        }
+        wolfSSL_CTX_set_session_cache_mode(wctx, WOLFSSL_SESS_CACHE_OFF);
+        dohprint(LOG_NOTICE, "TLS session resumption disabled (diagnostic mode)");
+    } else {
+        wolfSSL_CTX_set_session_cache_mode(wctx, WOLFSSL_SESS_CACHE_SERVER);
+        wolfSSL_CTX_set_timeout(wctx, 3600);
+        dohprint(LOG_NOTICE, "TLS session resumption enabled");
+    }
 
     if (wolfSSL_CTX_use_certificate_chain_file(wctx, cert) != SSL_SUCCESS) {
         dohprint(LOG_ERR, "ERROR: failed to load %s, please check the file.\n", cert);
